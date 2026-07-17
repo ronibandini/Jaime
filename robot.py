@@ -1,6 +1,18 @@
-# Jaime Arduino UNO Q Agentic robot
-# Script to send primitive commands to the MCU through the bridge
+# robot.py — OpenClaw skill file
 # Roni Bandini July 2026 - MIT License
+#
+# Place this file in your OpenClaw skill folder alongside PARKING.md.
+# bridge.py must be running on the UNO Q and reachable at localhost:8080.
+#
+# Usage from CLI (test):
+#   python3 robot.py "read sensors"
+#   python3 robot.py "move forward 2 seconds"
+#   python3 robot.py "rotate right 2 seconds"
+#   python3 robot.py "forward until 20"
+#   python3 robot.py "forward until line 2"
+#
+# Diagnostics: every call prints a console line with the HTTP request sent,
+# elapsed time, and the parsed response. Set DEBUG = False to silence.
 
 import json
 import re
@@ -39,6 +51,7 @@ def _call(method, *args):
         return {"success": False, "error": str(e)}
 
 # ─── Robot primitive functions (all routed through bridge.py → sketch) ───────
+# Cambiado int(seconds) por float(seconds) para soportar decimales
 def forward(seconds=1.0):    return _call("move", "forward", float(seconds))
 def back(seconds=1.0):       return _call("move", "back",    float(seconds))
 def turn_left(seconds=1.0):  return _call("move", "left",    float(seconds))
@@ -50,11 +63,11 @@ def forward_until(target_cm):
     return _call("forwardUntil", int(target_cm))
 
 def forward_until_line(line_number):
-    """Drive forward until the Nth line is crossed. Returns True if successful, False if blocked by obstacle."""
-    resp = _call("forwardUntilLine", int(line_number))
-    if resp.get("success"):
-        return resp.get("result") == "true"
-    return False
+    """Drive forward until the Nth line is crossed (20s MCU timeout).
+    Aborts early if the ultrasonic sensor detects a wall under 30cm.
+    result["result"] is the number of lines actually crossed: equal to
+    line_number on a normal finish, or lower if it stopped early for a wall."""
+    return _call("forwardUntilLine", int(line_number))
 
 def back_until_line(line_number):
     """Drive backward until the Nth line is crossed (20s MCU timeout)."""
@@ -89,6 +102,7 @@ def handle(command: str) -> str:
     cmd = command.lower().strip()
     _log(f"handle(\"{command}\")")
 
+    # stop
     if "stop" in cmd:
         stop()
         return "Robot stopped."
@@ -110,11 +124,13 @@ def handle(command: str) -> str:
         if not nums:
             return "Specify a line number, e.g. 'forward until line 2'."
         lineNum = int(float(nums[0]))
-        success = forward_until_line(lineNum)
-        if success:
-            return f"Moved forward until line {lineNum} successfully."
-        else:
-            return "Movement stopped: obstacle detected or command failed."
+        resp = forward_until_line(lineNum)
+        if not resp.get("success"):
+            return f"Error: {resp.get('error')}"
+        found = resp.get("result")
+        if isinstance(found, int) and found < lineNum:
+            return f"Stopped early: wall detected, found {found} of {lineNum} line(s)."
+        return f"Moved forward until line {lineNum}."
 
     # forward until <cm>
     if "forward" in cmd and "until" in cmd:
@@ -135,6 +151,7 @@ def handle(command: str) -> str:
 
     # rotate/turn right|left N seconds (time-based)
     if "rotat" in cmd or "turn" in cmd:
+        # Cambiado a float para preservar decimales
         seconds = float(nums[0]) if nums else 1.0
         if "right" in cmd:
             resp = turn_right(seconds)
@@ -149,6 +166,7 @@ def handle(command: str) -> str:
         return "Specify direction, e.g. 'rotate right 2 seconds'."
 
     # plain movement
+    # Cambiado a float para preservar decimales
     seconds = float(nums[0]) if nums else 1.0
     if any(w in cmd for w in ["forward", "ahead"]):
         resp = forward(seconds)
@@ -177,8 +195,10 @@ def handle(command: str) -> str:
         "'read sensors', 'stop'."
     )
 
+# OpenClaw skill entry point
 skill_handler = handle
 
+# ─── CLI self-test ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
     cmd = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "read sensors"
