@@ -1,18 +1,33 @@
 /*
-  Jaime Arduino UNO Q Robot
+  Arduino UNO Q Robot
   Roni Bandini July 2026
   MIT License
 
   Servos:      DFRobot 2.5g 360°    D13 = left, D12 = right
-  Line sensor: analog line detector A1   
+  Line sensor: analog line detector A1  (reads ~55-65 on yellow/white tape)
   Ultrasonic:  analog output        A0
+
+  Libraries (Sketch → Include Library → Manage Libraries):
+    - Arduino_RouterBridge   (included with UNO Q board support)
 
   Bridge functions (called from Python via bridge.py):
     move        (String cmd, float seconds)   forward/back/right/left/stop
     forwardUntil    (int targetCm)               drive forward until distance <= targetCm
-    forwardUntilLine(int lineNumber)              drive forward until the Nth line is crossed (returns string "true"/"false")
+    forwardUntilLine(int lineNumber)              drive forward until the Nth line is crossed;
+                                                   aborts early if a wall is detected under 30cm.
+                                                   Returns the number of lines actually crossed
+                                                   (equals lineNumber on a normal finish, less if
+                                                   it stopped early for a wall).
     backUntilLine   (int lineNumber)              drive backward until the Nth line is crossed
     readSensors     ()                            returns "distance,line"
+
+  Serial debug:
+    Runs at 115200 baud (raised from 9600) to keep print overhead from slowing
+    the line-detection polling loop.
+    Prints distance + raw line sensor value every 500ms in the main loop.
+    During forwardUntilLine/backUntilLine, prints only on line-state changes
+    (not every iteration) so the polling loop stays fast enough to catch
+    quick line crossings.
 */
 
 #include <Servo.h>
@@ -25,9 +40,13 @@ const int SONAR_PIN = A0;
 const int LINE_PIN  = A1;
 
 // ─── Ultrasonic ───────────────────────────────────────────────────────────────
+// UNO Q ADC ref = 3.3V, sensor VCC = 5V, 10-bit (0-1023)
+// Saturates at ~341 cm (sensor Vout exceeds 3.3V beyond that)
 #define SONAR_MAX_CM 520
 
 // ─── Line detector tuning ─────────────────────────────────────────────────────
+// Black is 1023. Yellow and white tape reads 55-65 on this sensor.
+// Widened slightly for margin.
 const int LINE_MIN = 950;
 const int LINE_MAX2 = 1023;
 
@@ -38,13 +57,9 @@ const int RIGHT_FWD  = 180;
 const int RIGHT_BACK = 0;
 const int STOP_VAL   = 90;
 
-// Smooth now :)
-const int LEFT_ROT_SLOW  = 105;  
-const int LEFT_ROT_FWD   = 75;   
-
 // ─── Pending command flags (set by Bridge, consumed in loop) ──────────────────
 volatile bool  pendingMove       = false;
-volatile float pendingSeconds    = 1.0f;
+volatile float pendingSeconds    = 1.0f; 
 char           pendingCmd[16]    = "";
 volatile bool  pendingFwdUntil   = false;
 volatile int   pendingFwdCm      = 30;
@@ -89,7 +104,7 @@ void driveForward() {
 
 void driveBack() {
   leftServo.write(LEFT_FWD);
-  rightServo.write(RIGHT_FORWARD); 
+  rightServo.write(RIGHT_FWD);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -109,15 +124,15 @@ void doBack(float seconds) {
 }
 
 void doRight(float seconds) {
-  leftServo.write(LEFT_ROT_SLOW); 
-  rightServo.write(STOP_VAL);
+  leftServo.write(LEFT_BACK);
+  rightServo.write(RIGHT_FWD);
   delay((unsigned long)(seconds * 1000.0f));
   stopMotors();
 }
 
 void doLeft(float seconds) {
-  leftServo.write(STOP_VAL);
-  rightServo.write(LEFT_ROT_SLOW); 
+  leftServo.write(LEFT_FWD);
+  rightServo.write(RIGHT_BACK);
   delay((unsigned long)(seconds * 1000.0f));
   stopMotors();
 }
@@ -145,7 +160,11 @@ void doForwardUntil(int targetCm) {
   Serial.println("[forwardUntil] done");
 }
 
-bool doForwardUntilLine(int targetLineNumber) {
+// Drives forward toward the Nth line, but aborts early if the ultrasonic
+// sensor reports a wall closer than 30cm. Returns the number of lines
+// actually crossed: equal to targetLineNumber on a normal finish, or a
+// smaller number if the wall stop cut it short.
+int doForwardUntilLine(int targetLineNumber) {
   Serial.print("[forwardUntilLine] target line: ");
   Serial.println(targetLineNumber);
 
@@ -159,10 +178,11 @@ bool doForwardUntilLine(int targetLineNumber) {
 
   while (millis() - start < 20000UL) {
     int dist = readUltrasonic();
-    if (dist > 0 && dist <= 30) {
-      Serial.println("[forwardUntilLine] Obstacle detected at <= 30cm! Stopping.");
-      stopMotors();
-      return false;
+    if (dist > 0 && dist < 30) {
+      Serial.print("  !!! wall at ");
+      Serial.print(dist);
+      Serial.println(" cm, stopping early");
+      break;
     }
 
     int value = readLineSensor();
@@ -188,8 +208,9 @@ bool doForwardUntilLine(int targetLineNumber) {
     delay(15);
   }
   stopMotors();
-  Serial.println("[forwardUntilLine] done");
-  return true;
+  Serial.print("[forwardUntilLine] done, linesCrossed=");
+  Serial.println(linesCrossed);
+  return linesCrossed;
 }
 
 void doBackUntilLine(int targetLineNumber) {
@@ -231,10 +252,10 @@ void doBackUntilLine(int targetLineNumber) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BRIDGE HANDLERS
+//  BRIDGE HANDLERS  (provide_safe → executes in loop() context)
 // ════════════════════════════════════════════════════════════════════════════
 
-void handleMove(String cmd, float seconds) {
+void handleMove(String cmd, float seconds) { 
   strncpy(pendingCmd, cmd.c_str(), sizeof(pendingCmd) - 1);
   pendingSeconds = seconds;
   pendingMove    = true;
@@ -245,9 +266,8 @@ void handleForwardUntil(int targetCm) {
   pendingFwdUntil = true;
 }
 
-String handleForwardUntilLine(int lineNumber) {
-  bool success = doForwardUntilLine(lineNumber);
-  return success ? "true" : "false";
+int handleForwardUntilLine(int lineNumber) {
+  return doForwardUntilLine(lineNumber);
 }
 
 void handleBackUntilLine(int lineNumber) {
@@ -294,6 +314,7 @@ void setup() {
 
 void loop() {
 
+  // ── Execute pending commands ──────────────────────────────────────────────
   if (pendingFwdUntil) {
     pendingFwdUntil = false;
     doForwardUntil(pendingFwdCm);
@@ -314,12 +335,14 @@ void loop() {
     else if (cmd == "stop")    stopMotors();
   }
 
+  // ── Periodic sensor Serial print ─────────────────────────────────────────
   int dist = readUltrasonic();
   int line = readLineSensor();
 
   Serial.print("Distance: ");
   if (dist < 0) Serial.print("no signal");
-  else { Serial.print(dist); Serial.print(" cm"); }
+  else { Serial.print(dist); Serial.print(" cm");
+  }
   Serial.print("  |  Line: ");
   Serial.print(line);
   Serial.print(isOnLine(line) ? " (ON LINE)" : "");
