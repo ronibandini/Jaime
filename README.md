@@ -153,6 +153,10 @@ building other Jaime-powered skills.
 | Analog line sensor | ~950–1023 reading = on a black line |
 | QMC5883L magnetometer | Marked "HMC" on some boards — it's a QMC5883L |
 
+## 📄 Demo
+
+https://youtu.be/_GZKD7dg9gM
+
 ---
 
 ## 📄 License
