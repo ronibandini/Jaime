@@ -1,63 +1,47 @@
 /*
-  Arduino UNO Q Robot
-  Roni Bandini July 2026
+  Arduino UNO Q AI Agentic Robot
+  Roni Bandini, July 2026, @ronibandini
   MIT License
+  Note: these primitives functions are called through the bridge by the MPU (OpenClaw using robot.py)
 
   Servos:      DFRobot 2.5g 360°    D13 = left, D12 = right
-  Line sensor: analog line detector A1  (reads ~55-65 on yellow/white tape)
+  Line sensor: analog line detector A1   
   Ultrasonic:  analog output        A0
+  Magnetometer: SDA, SCL
 
   Libraries (Sketch → Include Library → Manage Libraries):
-    - Arduino_RouterBridge   (included with UNO Q board support)
+    - Servo 1.3.0
+    - Gyvermag 1.0.0
 
-  Bridge functions (called from Python via bridge.py):
-    move        (String cmd, float seconds)   forward/back/right/left/stop
-    forwardUntil    (int targetCm)               drive forward until distance <= targetCm
-    forwardUntilLine(int lineNumber)              drive forward until the Nth line is crossed;
-                                                   aborts early if a wall is detected under 30cm.
-                                                   Returns the number of lines actually crossed
-                                                   (equals lineNumber on a normal finish, less if
-                                                   it stopped early for a wall).
-    backUntilLine   (int lineNumber)              drive backward until the Nth line is crossed
-    readSensors     ()                            returns "distance,line"
-
-  Serial debug:
-    Runs at 115200 baud (raised from 9600) to keep print overhead from slowing
-    the line-detection polling loop.
-    Prints distance + raw line sensor value every 500ms in the main loop.
-    During forwardUntilLine/backUntilLine, prints only on line-state changes
-    (not every iteration) so the polling loop stays fast enough to catch
-    quick line crossings.
 */
 
 #include <Servo.h>
 #include <Arduino_RouterBridge.h>
+#include <HMC5883L.h>
+#include <HMC5983L.h>
+#include <QMC5883L.h>
 
-// ─── Pins ─────────────────────────────────────────────────────────────────────
+// GPIOs
 const int LEFT_PIN  = 13;
 const int RIGHT_PIN = 12;
 const int SONAR_PIN = A0;
 const int LINE_PIN  = A1;
 
-// ─── Ultrasonic ───────────────────────────────────────────────────────────────
-// UNO Q ADC ref = 3.3V, sensor VCC = 5V, 10-bit (0-1023)
-// Saturates at ~341 cm (sensor Vout exceeds 3.3V beyond that)
+
 #define SONAR_MAX_CM 520
 
-// ─── Line detector tuning ─────────────────────────────────────────────────────
-// Black is 1023. Yellow and white tape reads 55-65 on this sensor.
-// Widened slightly for margin.
+// Line detector
 const int LINE_MIN = 950;
 const int LINE_MAX2 = 1023;
 
-// ─── Servo constants ──────────────────────────────────────────────────────────
+// Servos
 const int LEFT_FWD   = 0;
 const int LEFT_BACK  = 180;
 const int RIGHT_FWD  = 180;
 const int RIGHT_BACK = 0;
 const int STOP_VAL   = 90;
 
-// ─── Pending command flags (set by Bridge, consumed in loop) ──────────────────
+// Flags
 volatile bool  pendingMove       = false;
 volatile float pendingSeconds    = 1.0f; 
 char           pendingCmd[16]    = "";
@@ -66,13 +50,22 @@ volatile int   pendingFwdCm      = 30;
 volatile bool  pendingBackLine    = false;
 volatile int   pendingBackLineNum = 1;
 
-// ─── Objects ──────────────────────────────────────────────────────────────────
 Servo leftServo;
 Servo rightServo;
+QMC5883L mag;
 
-// ════════════════════════════════════════════════════════════════════════════
-//  SENSOR FUNCTIONS
-// ════════════════════════════════════════════════════════════════════════════
+// Compass related
+float frontHeading       = 0.0f;
+float leftTargetHeading  = 0.0f;
+float rightTargetHeading = 0.0f;
+bool  compassCalibrated  = false;
+volatile bool calibrationConverged = false;
+const unsigned long CALIBRATE_HARD_TIMEOUT_MS = 25000UL;
+const float         HEADING_TOLERANCE_DEG = 3.0f;
+const unsigned long TURN_PULSE_MS         = 200;   // turn pulse duration
+const unsigned long TURN_SETTLE_MS        = 150;   // motors off before reading compass
+const unsigned long TURN_TIMEOUT_MS       = 15000UL;
+
 
 int readUltrasonic() {
   int raw = analogRead(SONAR_PIN);
@@ -88,9 +81,7 @@ bool isOnLine(int value) {
   return value >= LINE_MIN && value <= LINE_MAX2;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  MOTOR PRIMITIVES
-// ════════════════════════════════════════════════════════════════════════════
+
 
 void stopMotors() {
   leftServo.write(STOP_VAL);
@@ -107,9 +98,6 @@ void driveBack() {
   rightServo.write(RIGHT_FWD);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  TIMED MOVEMENT FUNCTIONS
-// ════════════════════════════════════════════════════════════════════════════
 
 void doForward(float seconds) {
   driveForward();
@@ -137,9 +125,7 @@ void doLeft(float seconds) {
   stopMotors();
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  SENSOR-BASED MOVEMENT FUNCTIONS
-// ════════════════════════════════════════════════════════════════════════════
+
 
 void doForwardUntil(int targetCm) {
   Serial.print("[forwardUntil] target: ");
@@ -160,10 +146,7 @@ void doForwardUntil(int targetCm) {
   Serial.println("[forwardUntil] done");
 }
 
-// Drives forward toward the Nth line, but aborts early if the ultrasonic
-// sensor reports a wall closer than 30cm. Returns the number of lines
-// actually crossed: equal to targetLineNumber on a normal finish, or a
-// smaller number if the wall stop cut it short.
+
 int doForwardUntilLine(int targetLineNumber) {
   Serial.print("[forwardUntilLine] target line: ");
   Serial.println(targetLineNumber);
@@ -251,9 +234,157 @@ void doBackUntilLine(int targetLineNumber) {
   Serial.println("[backUntilLine] done");
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  BRIDGE HANDLERS  (provide_safe → executes in loop() context)
-// ════════════════════════════════════════════════════════════════════════════
+
+
+bool onCalibrate(const MagCalProgress& p) {
+  Serial.print("  t=");
+  Serial.print(p.elapsed);
+  Serial.print(" ms  balance=");
+  Serial.print(p.balance * 100.0f, 0);
+  Serial.print("%  radius=");
+  Serial.println(p.gaussR);
+
+  bool goodFit     = p.elapsed > 15000 && p.balance > 0.75f && p.gaussR > 0.15f;
+  bool hardTimeout = p.elapsed > CALIBRATE_HARD_TIMEOUT_MS;
+
+  if (goodFit || hardTimeout) {
+    calibrationConverged = goodFit;
+    return true;
+  }
+  return false;
+}
+
+
+void calibrateCompass() {
+  Serial.println();
+  Serial.println("=== Compass calibration ===");
+  Serial.println("Turn the robot in place for about 3 full slow spins now.");
+  Serial.println("(runs for up to 25 seconds)");
+
+  calibrationConverged = false;
+  unsigned long calStart = millis();
+  mag.calibrate(onCalibrate);
+  unsigned long calElapsed = millis() - calStart;
+
+  MagGauss g = mag.readGauss();
+  float heading = mag.headingDeg();
+
+  Serial.println();
+  Serial.print("Calibration ");
+  Serial.println(calibrationConverged
+    ? "converged."
+    : "hit the safety timeout (may still be a bit biased).");
+  Serial.print("  elapsed: ");     Serial.print(calElapsed); Serial.println(" ms");
+  Serial.print("  heading ahorita: "); Serial.print(heading);
+  Serial.print("  (X=");           Serial.print(g[0]);
+  Serial.print(" Y=");             Serial.print(g[1]);
+  Serial.print(" Z=");             Serial.print(g[2]);
+  Serial.println(")");
+  Serial.println("============================");
+  Serial.println();
+}
+
+// Reads a fresh sample and returns hd in degrees.
+float readHeading() {
+  mag.readGauss();
+  return mag.headingDeg();
+}
+
+// Smallest angular distance from current to target, in [-180, 180].
+float headingDiff(float targetHeading, float currentHeading) {
+  float diff = targetHeading - currentHeading;
+  if (diff < -180.0f) diff += 360.0f;
+  if (diff > 180.0f)  diff -= 360.0f;
+  return diff;
+}
+
+
+bool doSetCalibration(float front, float left, float right) {
+  frontHeading       = front;
+  leftTargetHeading  = left;
+  rightTargetHeading = right;
+  compassCalibrated  = true;
+
+  Serial.print("[setCalibration] front="); Serial.print(frontHeading);
+  Serial.print("  left=");  Serial.print(leftTargetHeading);
+  Serial.print("  right="); Serial.println(rightTargetHeading);
+  return true;
+}
+
+
+String turnToHeading(float targetHeading) {
+  unsigned long start = millis();
+  float startHeading = readHeading();
+  float current = startHeading;
+  int pulses = 0;
+
+  float initialDiff = headingDiff(targetHeading, current);
+  int   initialSign  = (initialDiff >= 0) ? 1 : -1;
+  bool  turnRight    = (initialDiff >= 0);   // shorter arc: positive diff = go right
+
+  while (millis() - start < TURN_TIMEOUT_MS) {
+    current = readHeading();
+    float diff       = headingDiff(targetHeading, current);
+    int   currentSign = (diff >= 0) ? 1 : -1;
+
+    Serial.print("  pulse=");   Serial.print(pulses);
+    Serial.print("  current="); Serial.print(current);
+    Serial.print("  target=");  Serial.print(targetHeading);
+    Serial.print("  diff=");    Serial.println(diff);
+
+    if (abs(diff) <= HEADING_TOLERANCE_DEG || currentSign != initialSign) {
+      stopMotors();
+      Serial.println("  reached/crossed target heading");
+      return "1," + String(pulses) + "," + String(startHeading, 1) + "," +
+             String(current, 1) + "," + String(targetHeading, 1);
+    }
+
+    if (turnRight) {
+      leftServo.write(LEFT_BACK);
+      rightServo.write(RIGHT_FWD);
+    } else {
+      leftServo.write(LEFT_FWD);
+      rightServo.write(RIGHT_BACK);
+    }
+    delay(TURN_PULSE_MS);
+    stopMotors();
+    delay(TURN_SETTLE_MS);
+    pulses++;
+  }
+  stopMotors();
+  Serial.println("  !!! timeout reaching target heading");
+  return "0," + String(pulses) + "," + String(startHeading, 1) + "," +
+         String(current, 1) + "," + String(targetHeading, 1);
+}
+
+String doTurnLeft90() {
+  if (!compassCalibrated) {
+    Serial.println("[turnLeft90] ERROR: run setCalibration first");
+    return "notCalibrated";
+  }
+  Serial.println("[turnLeft90] adjusting to the 'left' heading (shortest path)");
+  return turnToHeading(leftTargetHeading);
+}
+
+String doTurnRight90() {
+  if (!compassCalibrated) {
+    Serial.println("[turnRight90] ERROR: run setCalibration first");
+    return "notCalibrated";
+  }
+  Serial.println("[turnRight90] adjusting to the 'right' heading (shortest path)");
+  return turnToHeading(rightTargetHeading);
+}
+
+// Adjusts back to the stored front heading, via the shorter arc.
+String doHeadingFront() {
+  if (!compassCalibrated) {
+    Serial.println("[headingFront] ERROR: run setCalibration first");
+    return "notCalibrated";
+  }
+  Serial.println("[headingFront] adjusting to the 'front' heading (shortest path)");
+  return turnToHeading(frontHeading);
+}
+
 
 void handleMove(String cmd, float seconds) { 
   strncpy(pendingCmd, cmd.c_str(), sizeof(pendingCmd) - 1);
@@ -278,12 +409,27 @@ void handleBackUntilLine(int lineNumber) {
 String handleReadSensors() {
   int dist = readUltrasonic();
   int line = readLineSensor();
-  return String(dist) + "," + String(line);
+  float heading = readHeading();
+  return String(dist) + "," + String(line) + "," + String(heading, 1);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  SETUP
-// ════════════════════════════════════════════════════════════════════════════
+bool handleSetCalibration(float front, float left, float right) {
+  return doSetCalibration(front, left, right);
+}
+
+String handleTurnLeft90() {
+  return doTurnLeft90();
+}
+
+String handleTurnRight90() {
+  return doTurnRight90();
+}
+
+String handleHeadingFront() {
+  return doHeadingFront();
+}
+
+// Setup ******************************************************************
 
 void setup() {
   Serial.begin(115200);
@@ -296,8 +442,12 @@ void setup() {
   stopMotors();
 
   pinMode(LINE_PIN, INPUT);
+
+  Wire.begin();
+  mag.begin();   
+
   if (!Bridge.begin()) {
-    Serial.println("Bridge init failed");
+    Serial.println("Bridge start fail");
   }
 
   Bridge.provide_safe("move",             handleMove);
@@ -305,16 +455,21 @@ void setup() {
   Bridge.provide_safe("forwardUntilLine", handleForwardUntilLine);
   Bridge.provide_safe("backUntilLine",    handleBackUntilLine);
   Bridge.provide_safe("readSensors",      handleReadSensors);
-  Serial.println("Ready.");
+  Bridge.provide_safe("setCalibration",   handleSetCalibration);
+  Bridge.provide_safe("turnLeft90",       handleTurnLeft90);
+  Bridge.provide_safe("turnRight90",      handleTurnRight90);
+  Bridge.provide_safe("headingFront",     handleHeadingFront);
+  Serial.println("Bridge ready.");
+
+  calibrateCompass();
+
+  Serial.println("All good.");
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  LOOP
-// ════════════════════════════════════════════════════════════════════════════
+
 
 void loop() {
 
-  // ── Execute pending commands ──────────────────────────────────────────────
   if (pendingFwdUntil) {
     pendingFwdUntil = false;
     doForwardUntil(pendingFwdCm);
@@ -335,9 +490,12 @@ void loop() {
     else if (cmd == "stop")    stopMotors();
   }
 
-  // ── Periodic sensor Serial print ─────────────────────────────────────────
+
   int dist = readUltrasonic();
   int line = readLineSensor();
+
+  MagGauss g = mag.readGauss();
+  float heading = mag.headingDeg();
 
   Serial.print("Distance: ");
   if (dist < 0) Serial.print("no signal");
@@ -346,6 +504,15 @@ void loop() {
   Serial.print("  |  Line: ");
   Serial.print(line);
   Serial.print(isOnLine(line) ? " (ON LINE)" : "");
+  Serial.print("  |  Heading: ");
+  Serial.print(heading);
+  Serial.print("  (X=");
+  Serial.print(g[0]);
+  Serial.print(" Y=");
+  Serial.print(g[1]);
+  Serial.print(" Z=");
+  Serial.print(g[2]);
+  Serial.print(")");
   Serial.println();
 
   delay(500);
