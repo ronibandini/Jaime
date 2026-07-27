@@ -1,7 +1,7 @@
-# Jaime Arduino UNO Q Agentic robot
-# Bridge between MCU and MPU
-# Roni Bandini July 2026 - MIT License
-# Run with $ nohup python3 bridge.py > bridge.log 2>&1 & 
+# Jaime Arduino UNO Q Agentic AI robot
+# This is the bridge between UNO Q MCU and MPU, must be running in the bkg
+# Roni Bandini July 2026 - MIT License @ronibandini
+# Add to cron or manually run with $ nohup python3 bridge.py > bridge.log 2>&1 & 
 
 import socket
 import threading
@@ -152,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"status": "ok"})
+            self._json(200, {"status": "ok", "robot": "Jaime"})
         else:
             self._json(404, {"error": "not found"})
 
@@ -174,10 +174,38 @@ class Handler(BaseHTTPRequestHandler):
                     raw = raw.decode()
                 if isinstance(raw, str) and "," in raw:
                     parts = raw.split(",")
-                    result["result"] = {
-                        "distance": int(parts[0]),
-                        "line":     int(parts[1])
-                    }
+                    try:
+                        result["result"] = {
+                            "distance": int(parts[0]),
+                            "line":     int(parts[1]),
+                            "heading":  float(parts[2])
+                        }
+                    except (ValueError, IndexError):
+                        result["result"] = {
+                            "distance": int(parts[0]),
+                            "line":     int(parts[1])
+                        }
+
+            if method in ("turnLeft90", "turnRight90", "headingFront") and result.get("success"):
+                raw = result.get("result", "")
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode()
+                if isinstance(raw, str):
+                    if raw == "notCalibrated":
+                        result["result"] = {"calibrated": False, "reached": False}
+                    elif "," in raw:
+                        parts = raw.split(",")
+                        try:
+                            result["result"] = {
+                                "calibrated": True,
+                                "reached": bool(int(parts[0])),
+                                "pulses":  int(parts[1]),
+                                "start":   float(parts[2]),
+                                "final":   float(parts[3]),
+                                "target":  float(parts[4])
+                            }
+                        except (ValueError, IndexError):
+                            pass
 
             self._json(200, result)
         except Exception as e:
@@ -193,11 +221,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 def run():
-    log("Starting bridge...")
+    log("Starting jaime MCU MPU bridge...")
     if not bridge.connect():
         log(f"FATAL: cannot connect to {SOCKET_PATH}")
         return
     log(f"HTTP API listening on port {HTTP_PORT}")
+    log("Jaime robot bridge running")
     httpd = HTTPServer(("", HTTP_PORT), Handler)
     try:
         httpd.serve_forever()
