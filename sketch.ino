@@ -62,7 +62,7 @@ bool  compassCalibrated  = false;
 volatile bool calibrationConverged = false;
 const unsigned long CALIBRATE_HARD_TIMEOUT_MS = 25000UL;
 const float         HEADING_TOLERANCE_DEG = 3.0f;
-const unsigned long TURN_PULSE_MS         = 200;   // turn pulse duration
+const unsigned long TURN_PULSE_MS         = 50;   // turn pulse duration
 const unsigned long TURN_SETTLE_MS        = 150;   // motors off before reading compass
 const unsigned long TURN_TIMEOUT_MS       = 15000UL;
 
