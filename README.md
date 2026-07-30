@@ -155,6 +155,7 @@ building other Jaime-powered skills.
 
 ## 📄 Demo
 
+https://www.youtube.com/shorts/6l1wQNMgGkE
 https://youtu.be/_GZKD7dg9gM
 
 ---
