@@ -1,3 +1,5 @@
+<img width="1388" height="982" alt="UNOQRobot2" src="https://github.com/user-attachments/assets/f9ec504b-4667-4801-9c90-b7cbb7e68224" />
+
 # 🤖 Jaime — Autonomous Arduino UNO Q Robot
 
 **An AI Agentic robot built on the Arduino UNO Q.**
