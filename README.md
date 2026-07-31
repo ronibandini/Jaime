@@ -160,6 +160,11 @@ https://youtu.be/_GZKD7dg9gM
 
 ---
 
+## Full tutorial
+
+https://projecthub.arduino.cc/ronibandini/jaime-bb8a4a
+
+---
 ## 📄 License
 
 MIT License — see source file headers.
